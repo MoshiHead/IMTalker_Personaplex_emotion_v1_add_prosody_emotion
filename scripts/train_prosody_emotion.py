@@ -20,10 +20,21 @@ Datasets (download manually, they are public but not pip-installable):
 Validation is speaker-grouped k-fold CV: no speaker appears in both train and
 test, so the reported accuracy is an honest estimate for a *new* voice.
 
+Channel robustness: --noise_aug (default ON) adds a noisy copy of every
+training utterance (white/pink noise, random 6-30 dB SNR). Without it the
+studio-trained model learns "bright/noisy spectrum = angry" and collapses
+every real-world (mic + room noise) recording to angry - reproduced
+experimentally: at 20 dB SNR all clean-trained predictions flip to angry.
+
+--extra_dir accepts a user folder with files named <emotion>-*.wav
+(angry/fear/happy/sad/neutral/surprise), added to training x10 so a handful of
+files matters. They form their own CV speaker group, so the CV report shows an
+honest held-out accuracy on the user's audio.
+
 Usage:
   python scripts/train_prosody_emotion.py --ravdess_dir /data/ravdess \
-      [--cremad_dir /data/cremad] [--augment] \
-      [--out IMTalker/checkpoints/prosody_emotion.npz]
+      [--cremad_dir /data/cremad] [--augment] [--extra_dir /workspace/audio] \
+      [--no_noise_aug] [--out IMTalker/checkpoints/prosody_emotion.npz]
   python scripts/train_prosody_emotion.py --selftest --out /tmp/prosody.npz
 
 After training, re-run scripts/switch_ser_to_prosody.py to embed the new
@@ -104,8 +115,55 @@ def load_wav(path: Path, target_sr: int = SR) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Channel-noise augmentation (the real-world robustness fix).
+# RAVDESS/CREMA-D are studio recordings; real audio carries mic/room noise.
+# Without a noisy copy of every training utterance, the noise direction
+# (high zcr/rolloff/mfcc-std/flux) stays discriminative and points at angry,
+# collapsing non-studio input to one class. Adding noisy copies makes those
+# features non-discriminative and forces the model onto noise-robust prosodic
+# cues (f0, syllable rate, energy dynamics).
+# ---------------------------------------------------------------------------
+
+NOISE_SNR_RANGE = (6.0, 30.0)   # dB, uniform per augmented copy
+
+
+def add_channel_noise(x: np.ndarray, rng: np.random.Generator,
+                      snr_db: float | None = None) -> np.ndarray:
+    """One noisy copy of x: white or pink noise at the given/random SNR."""
+    p_sig = float(np.sqrt(np.mean(np.square(x, dtype=np.float64)))) + 1e-12
+    snr = float(rng.uniform(*NOISE_SNR_RANGE)) if snr_db is None else float(snr_db)
+    noise = rng.standard_normal(x.shape[0])
+    if rng.random() < 0.5:          # pink-ish: integrated white, closer to room noise
+        noise = np.cumsum(noise)
+        noise -= noise.mean()
+    noise = noise / (float(np.sqrt(np.mean(np.square(noise)))) + 1e-12)
+    return (x + noise * p_sig / 10 ** (snr / 20)).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 # Dataset ingestion
 # ---------------------------------------------------------------------------
+
+# user extra-dir emotion prefix -> avatar id (None = skip the file)
+EXTRA_MAP = {"neutral": 0, "calm": 0, "happy": 1, "sad": 2, "angry": 3,
+             "surprise": 4, "surprised": 4, "fear": 5, "fearful": 5}
+EXTRA_EXTS = {".wav", ".flac", ".ogg", ".mp3", ".m4a"}
+EXTRA_REPEAT = 10   # a few user files must matter among thousands of dataset clips
+
+
+def scan_extra(root: Path):
+    """Yield (wav_path, emotion_id, speaker_id) for user files named
+    <emotion>-<anything>.<ext>, e.g. angry-1.wav. Unknown emotions are skipped."""
+    out = []
+    for wav in sorted(Path(root).rglob("*")):
+        if wav.suffix.lower() not in EXTRA_EXTS:
+            continue
+        emo = EXTRA_MAP.get(wav.stem.split("-")[0].lower())
+        if emo is None:
+            continue
+        out.append((wav, emo, "user_extra"))
+    return out
+
 
 def scan_ravdess(root: Path):
     """Yield (wav_path, emotion_id, speaker_id) for every usable RAVDESS clip."""
@@ -135,17 +193,22 @@ def scan_cremad(root: Path):
     return out
 
 
-def build_dataset(samples, augment: bool = False):
+def build_dataset(samples, augment: bool = False, noise_aug: bool = True,
+                  rng: np.random.Generator | None = None):
     """samples: list of (wav_path, emotion_id, speaker_id).
 
     Returns X (n, FEATURE_DIM), y (n,), speakers (n,). Feature extraction uses
     the exact inference-time function, guaranteeing train/serve parity.
     Augmentation (optional, x5): gain {0.7, 1.3} and tape-style speed factors
-    {0.9, 1.1} applied via resampling (pitch+tempo shift).
+    {0.9, 1.1} applied via resampling (pitch+tempo shift). With noise_aug
+    (default on) every utterance also contributes one noisy copy (white/pink
+    noise at a random 6-30 dB SNR) - the channel-robustness fix.
     """
     variants = [(1.0, 1.0)]
     if augment:
         variants += [(1.3, 1.0), (0.7, 1.0), (1.0, 1.1), (1.0, 0.9)]
+    if rng is None:
+        rng = np.random.default_rng(0)
     X, y, spk = [], [], []
     t0 = time.time()
     for i, (wav, emo, speaker) in enumerate(samples):
@@ -168,6 +231,12 @@ def build_dataset(samples, augment: bool = False):
             X.append(feats)
             y.append(emo)
             spk.append(speaker)
+        if noise_aug:
+            feats = pe.extract_features(add_channel_noise(base, rng))
+            if feats.any():
+                X.append(feats)
+                y.append(emo)
+                spk.append(speaker)
         if (i + 1) % 100 == 0:
             rate = (i + 1) / max(time.time() - t0, 1e-6)
             print(f"  features: {i + 1}/{len(samples)} files ({rate:.0f}/s)")
@@ -302,22 +371,36 @@ def run_selftest(out_path: Path, folds: int, seed: int) -> None:
             speaker = speakers[s % len(speakers)]
             rng_spk = np.random.default_rng(rng.integers(0, 2**31))
             x = synth_selftest_sample(emo, rng_spk)
-            feats = pe.extract_features(x)
-            X.append(feats)
-            y.append(emo)
-            spk.append(speaker)
+            for variant in (x, add_channel_noise(x, rng)):  # clean + noisy copy
+                feats = pe.extract_features(variant)
+                X.append(feats)
+                y.append(emo)
+                spk.append(speaker)
     X, y, spk = np.stack(X), np.array(y), np.array(spk)
-    print(f"selftest dataset: {X.shape[0]} synthetic utterances, "
+    print(f"selftest dataset: {X.shape[0]} synthetic utterances (clean + noise-augmented), "
           f"{len(np.unique(spk))} simulated speakers")
     mean_acc, oof, _ = speaker_cv(X, y, spk, folds=folds, seed=seed)
     print_report(y, oof, "selftest speaker-grouped CV (synthetic data)")
-    mu, sd = X.mean(0), X.std(0) + 1e-6
+    mu, sd = X.mean(0), np.maximum(X.std(0), 1e-3)
     W, b = train_softmax((X - mu) / sd, y, seed=seed)
     pe.save_weights(out_path, W, b, mu, sd)
     print(f"\n[ok] selftest weights written: {out_path} "
           f"({out_path.stat().st_size} bytes), CV acc {mean_acc:.1%}")
     if mean_acc < 0.55:
         sys.exit("selftest CV accuracy suspiciously low - the pipeline is broken")
+
+    # Channel-robustness regression guard: synthetic profiles under 12 dB noise
+    # must not collapse to one class (the all-angry bug this augmentation fixes).
+    rng_guard = np.random.default_rng(seed + 99)
+    clf = pe.ProsodyEmotionClassifier(weights_path=out_path, verbose=False)
+    preds = [clf.predict(add_channel_noise(synth_selftest_sample(emo, rng_guard),
+                                           rng_guard, snr_db=12.0))[0]
+             for emo in range(pe.NUM_EMOTIONS)]
+    n_ok = sum(int(p == e) for e, p in enumerate(preds))
+    print(f"[ok] noise-robustness guard: {n_ok}/{pe.NUM_EMOTIONS} profiles correct at "
+          f"12 dB SNR: {[pe.EMOTION_NAMES[p] for p in preds]}")
+    if n_ok < pe.NUM_EMOTIONS - 1:
+        sys.exit("noise-robustness guard failed: predictions collapse under channel noise")
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +415,12 @@ def main() -> None:
     ap.add_argument("--out", default=str(ROOT / "IMTalker" / "checkpoints" / "prosody_emotion.npz"))
     ap.add_argument("--augment", action="store_true",
                     help="5x data: gain {0.7,1.3} + tape speed {0.9,1.1}")
+    ap.add_argument("--noise_aug", action=argparse.BooleanOptionalAction, default=True,
+                    help="add a noisy copy of every utterance (default: on; the "
+                         "channel-robustness fix for non-studio audio)")
+    ap.add_argument("--extra_dir", default="",
+                    help="optional user folder with <emotion>-*.wav files "
+                         "(angry/fear/happy/sad/neutral/surprise); added x%d" % EXTRA_REPEAT)
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--selftest", action="store_true",
@@ -352,17 +441,44 @@ def main() -> None:
         found = scan_cremad(Path(args.cremad_dir))
         print(f"CREMA-D: {len(found)} usable clips under {args.cremad_dir}")
         samples += found
+    extra_names = []
+    if args.extra_dir:
+        found = scan_extra(Path(args.extra_dir))
+        if found:
+            emos = sorted({pe.EMOTION_NAMES[e] for _, e, _ in found})
+            print(f"extra audio: {len(found)} usable clips under {args.extra_dir} "
+                  f"({', '.join(emos)}), replicated x{EXTRA_REPEAT}")
+            print("             note: these files are IN the training set - testing on the")
+            print("             same folder afterwards measures training data, not generalisation")
+            samples += found * EXTRA_REPEAT
+            extra_names = sorted({wav.name for wav, _, _ in found})
+        else:
+            print(f"[warn] --extra_dir given but no <emotion>-*.wav files found under {args.extra_dir}")
     if not samples:
         sys.exit("no clips found - pass --ravdess_dir/--cremad_dir or use --selftest")
 
-    print(f"extracting features ({'5x augmented' if args.augment else 'no augmentation'})...")
-    X, y, speakers = build_dataset(samples, augment=args.augment)
+    aug_desc = []
+    if args.augment:
+        aug_desc.append("5x gain/speed")
+    if args.noise_aug:
+        aug_desc.append("+1 noisy copy each (6-30 dB SNR)")
+    print(f"extracting features ({', '.join(aug_desc) or 'no augmentation'})...")
+    X, y, speakers = build_dataset(samples, augment=args.augment,
+                                   noise_aug=args.noise_aug,
+                                   rng=np.random.default_rng(args.seed))
     print(f"dataset: {X.shape[0]} utterances, {len(np.unique(speakers))} speakers, "
           f"class counts {np.bincount(y, minlength=pe.NUM_EMOTIONS).tolist()}")
 
     print(f"\nspeaker-grouped {args.folds}-fold CV:")
     mean_acc, oof, fold_accs = speaker_cv(X, y, speakers, folds=args.folds, seed=args.seed)
     print_report(y, oof, "speaker-independent CV (held-out speakers = unseen voices)")
+    if extra_names:
+        user_mask = speakers == "user_extra"
+        # user files are their own speaker group: one fold held them ALL out,
+        # so their out-of-fold predictions are an honest generalisation estimate
+        print(f"\n  user extra files (held out as their own speaker group): "
+              f"{(oof[user_mask] == y[user_mask]).mean():.1%} honest accuracy on your audio "
+              f"(n={int(user_mask.sum())})")
 
     # final model: all data
     mu, sd = X.mean(0), np.maximum(X.std(0), 1e-3)
@@ -371,7 +487,7 @@ def main() -> None:
     print(f"\nfinal model train accuracy (all data): {train_acc:.1%}")
     print_feature_importance(W, sd)
 
-    pe.save_weights(out_path, W, b, mu, sd)
+    pe.save_weights(out_path, W, b, mu, sd, extra_files=extra_names)
     print(f"\n[ok] weights written: {out_path} ({out_path.stat().st_size} bytes)")
 
     # quick latency check with the freshly trained model

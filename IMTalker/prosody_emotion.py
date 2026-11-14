@@ -394,7 +394,14 @@ _RULE_MODEL = _build_rule_model()
 # ---------------------------------------------------------------------------
 
 def save_weights(path, W: np.ndarray, b: np.ndarray, feat_mean: np.ndarray,
-                 feat_std: np.ndarray, temperature: float = 1.0) -> None:
+                 feat_std: np.ndarray, temperature: float = 1.0,
+                 extra_files=None) -> None:
+    """Persist a trained model (~7 KB npz).
+
+    extra_files: optional list of user file names that were part of training
+    (trainer --extra_dir), stored as metadata so the batch-test cell can flag
+    predictions on those files as training-set results.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
@@ -406,6 +413,7 @@ def save_weights(path, W: np.ndarray, b: np.ndarray, feat_mean: np.ndarray,
         feature_names=np.array(FEATURE_NAMES),
         temperature=np.float32(temperature),
         format_version=np.int32(WEIGHTS_FORMAT_VERSION),
+        extra_files=np.array(list(extra_files or []), dtype=str),
     )
 
 

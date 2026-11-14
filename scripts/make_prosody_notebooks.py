@@ -209,14 +209,22 @@ Runs `scripts/train_prosody_emotion.py`:
 - 56-dim prosodic features per clip (F0 stats/contour, voiced-time RMS stats,
   pauses / speech rate, spectral flux / centroid, voiced ZCR, coarse formant
   proxies) — the identical code path the live avatar uses at inference.
-- Optional 5x augmentation (gain {0.7, 1.3} x tape-speed {0.9, 1.1}).
+- **Noise augmentation (always on)**: every training clip also appears once
+  with added white/pink noise at a random 6–30 dB SNR. RAVDESS/CREMA-D are
+  studio recordings; without this the model learns "bright/noisy spectrum =
+  angry" and collapses *every real-world recording to angry*. This is the
+  channel-robustness fix.
+- **Your own audio** (`EXTRA_AUDIO_DIR`): files named `<emotion>-*.wav`
+  (angry/fear/happy/sad/neutral/surprise) are added to training ×10. They form
+  their own CV speaker group, so the report shows an honest held-out accuracy
+  on *your* audio. Set to `""` for pure dataset training.
 - Standardize → numpy softmax regression (full-batch L-BFGS).
 - **Speaker-grouped k-fold CV** (no speaker appears in both train and test) →
   an honest generalization estimate, then a final refit on 100% of the data.
 - Writes `prosody_emotion.npz` (~7 KB: weights, bias, mu, sd, meta).
 
-Expected duration: ~15–25 min with CREMA-D + augmentation (CPU-bound feature
-extraction), a few minutes RAVDESS-only.
+Expected duration: ~15–30 min with CREMA-D (CPU-bound feature extraction),
+a few minutes RAVDESS-only.
 """
 
 NB1_MD_14 = """\
@@ -482,6 +490,10 @@ from pathlib import Path
 WEIGHTS_PATH = Path(PROJECT_ROOT) / "IMTalker" / "checkpoints" / "prosody_emotion.npz"
 WEIGHTS_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+# Your own labeled audio (files named <emotion>-*.wav) joins the training set
+# x10 - adapts the model to your voice/room. Set to "" for pure dataset training.
+EXTRA_AUDIO_DIR = "/workspace/audio"
+
 cmd = [
     sys.executable, str(Path(PROJECT_ROOT) / "scripts" / "train_prosody_emotion.py"),
     "--ravdess_dir", str(RAVDESS_DIR),
@@ -492,6 +504,11 @@ if cremad_ok:
     cmd += ["--cremad_dir", str(CREMAD_AUDIO_DIR)]
 if AUGMENT:
     cmd += ["--augment"]
+if EXTRA_AUDIO_DIR:
+    if Path(EXTRA_AUDIO_DIR).is_dir():
+        cmd += ["--extra_dir", EXTRA_AUDIO_DIR]
+    else:
+        print(f"[skip] EXTRA_AUDIO_DIR does not exist: {EXTRA_AUDIO_DIR}")
 print("[run]", " ".join(cmd))
 t0 = time.time()
 proc = subprocess.run(cmd)
@@ -612,6 +629,14 @@ if "clf" not in dir() or getattr(clf, "backend", None) != "softmax":
     clf = pe.ProsodyEmotionClassifier(weights_path=str(WEIGHTS_PATH))
     assert clf.backend == "softmax", "trained weights not loaded - run the training cell first"
 
+# files that were included in training via --extra_dir (metadata in the npz) -
+# predictions on them are training-set results, not generalisation evidence
+_trained_on = set()
+if WEIGHTS_PATH.is_file():
+    with np.load(WEIGHTS_PATH) as _w:
+        if "extra_files" in _w.files:
+            _trained_on = {str(x) for x in _w["extra_files"]}
+
 
 def classify_wav(wav):
     # Classify a waveform; files longer than MAX_FILE_S are split into
@@ -657,7 +682,7 @@ else:
         print(f"{'file':<50} {'predicted':<14} {'conf':>5}  top-3  [details]")
         print("-" * 110)
         counts = Counter()
-        n_skip = n_err = n_ood = 0
+        n_skip = n_err = n_ood = n_extra = 0
         t0 = time.perf_counter()
         for p in files:
             try:
@@ -679,6 +704,9 @@ else:
                 if len(probs_list) > 1:
                     tally = ", ".join(f"{pe.EMOTION_NAMES[k]}x{v}" for k, v in votes.most_common())
                     detail += f", {len(probs_list)} chunks: {tally}"
+                if p.name in _trained_on:
+                    n_extra += 1
+                    detail += ", in training"
                 print(f"{p.name[:50]:<50} {label + f' ({y})':<14} {conf:5.2f}  {top3}  [{detail}]")
                 if max_z > OOD_Z:
                     n_ood += 1
@@ -697,6 +725,9 @@ else:
             print(f"[warn] {n_ood} file(s) were far outside the RAVDESS training distribution")
             print(f"       (max|z| > {OOD_Z:.0f}); their confidence is unreliable - predictions")
             print(f"       there are clipped to the |z| <= {pe.Z_CLIP:.0f} boundary, not saturated.")
+        if n_extra:
+            print(f"[info] {n_extra} file(s) marked 'in training' were part of --extra_dir")
+            print(f"       training - high accuracy on them is expected, not generalisation")
         if counts:
             print(f"[info] avg {dt / sum(counts.values()) * 1000:.1f} ms/file")
 """
@@ -875,7 +906,7 @@ def validate_nb1(nb, pe_payload, tr_payload):
     assert tr_payload in cell3, "embedded train_prosody_emotion.py payload missing/altered"
     for needle in ("REPO_URL", "RAVDESS_URLS", "zenodo.org/records/1188976", "git lfs pull",
                    "speaker-grouped", "WEIGHTS_OUT", "prosody_emotion.npz", "TEST_AUDIO_DIR",
-                   "SEGMENT_S", "classify_wav", "max|z|"):
+                   "SEGMENT_S", "classify_wav", "max|z|", "EXTRA_AUDIO_DIR", "extra_files"):
         assert any(needle in "".join(c["source"]) for c in nb["cells"]), f"missing: {needle}"
     print(f"[ok] NB1 validated: {len(nb['cells'])} cells, all code cells compile, embeds byte-identical")
 
@@ -956,12 +987,30 @@ def dryrun_nb1(nb1, pe_payload, tr_payload):
     ns["cremad_ok"] = False
     exec(compile(cells["prosody-train-11"], "<cell-11>", "exec"), ns)  # audit
 
-    # Train via the CLI on the synthetic data (fast, honest end-to-end run).
+    # probe folder: two emotion-named files (join training via --extra_dir) plus
+    # unnamed robustness probes (gain pair, 20 s file)
+    probe_dir = tmp / "probe_audio"
+    probe_dir.mkdir()
+    t3 = np.arange(int(sr * 3.0)) / sr
+    base = (0.2 * np.sin(2 * np.pi * 140 * t3)
+            * (0.5 + 0.5 * np.sin(2 * np.pi * 3.5 * t3))).astype("float32")
+    t20 = np.arange(int(sr * 20.0)) / sr
+    long20 = (0.2 * np.sin(2 * np.pi * 175 * t20)
+              * (0.5 + 0.5 * np.sin(2 * np.pi * 2.5 * t20))).astype("float32")
+    write_wav(probe_dir / "happy-probe.wav", 0.25 * np.sin(2 * np.pi * 240 * t3), sr)
+    write_wav(probe_dir / "sad-probe.wav", 0.25 * np.sin(2 * np.pi * 95 * t3), sr)
+    write_wav(probe_dir / "probe_quiet.wav", base, sr)
+    write_wav(probe_dir / "probe_loud.wav", base * 3.0, sr)
+    write_wav(probe_dir / "probe_long20s.wav", long20, sr)
+
+    # Train via the CLI on the synthetic data (fast, honest end-to-end run,
+    # exercising --extra_dir and the default-on noise augmentation).
     weights = proj / "IMTalker" / "checkpoints" / "prosody_emotion.npz"
     weights.parent.mkdir(parents=True, exist_ok=True)
     proc = subprocess.run(
         [sys.executable, str(proj / "scripts" / "train_prosody_emotion.py"),
-         "--ravdess_dir", str(rav), "--out", str(weights), "--folds", "2", "--seed", "0"])
+         "--ravdess_dir", str(rav), "--extra_dir", str(probe_dir),
+         "--out", str(weights), "--folds", "2", "--seed", "0"])
     assert proc.returncode == 0, "dryrun training failed"
     assert weights.is_file() and weights.stat().st_size > 1000
 
@@ -974,29 +1023,20 @@ def dryrun_nb1(nb1, pe_payload, tr_payload):
     exec(compile(test_src, "<cell-17>", "exec"), ns)
     print("[dryrun] Step 8 batch-test cell executed against the synthetic folder")
 
-    # Step 8 robustness: a 20 s file must be segmented into chunks, and the
-    # same utterance 9.5 dB louder must predict the same emotion (the
+    # Step 8 robustness: a 20 s file must be segmented into chunks, the
+    # emotion-named probe files must be flagged 'in training', and the same
+    # utterance 9.5 dB louder must predict the same emotion (the
     # loudness-collapse regression guard).
     import contextlib
     import io
 
-    probe_dir = tmp / "probe_audio"
-    probe_dir.mkdir()
-    t3 = np.arange(int(sr * 3.0)) / sr
-    base = (0.2 * np.sin(2 * np.pi * 140 * t3)
-            * (0.5 + 0.5 * np.sin(2 * np.pi * 3.5 * t3))).astype("float32")
-    t20 = np.arange(int(sr * 20.0)) / sr
-    long20 = (0.2 * np.sin(2 * np.pi * 175 * t20)
-              * (0.5 + 0.5 * np.sin(2 * np.pi * 2.5 * t20))).astype("float32")
-    write_wav(probe_dir / "probe_quiet.wav", base, sr)
-    write_wav(probe_dir / "probe_loud.wav", base * 3.0, sr)
-    write_wav(probe_dir / "probe_long20s.wav", long20, sr)
     test_src2 = cells["prosody-train-17"].replace('"/workspace/audio"', f'"{probe_dir.as_posix()}"')
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         exec(compile(test_src2, "<cell-17b>", "exec"), ns)
     out = buf.getvalue()
     assert "chunks:" in out, f"20 s file was not segmented by the Step 8 cell:\n{out}"
+    assert "in training" in out, f"--extra_dir files not flagged as in-training:\n{out}"
 
     def _pred(path):
         wav = ns["trainer"].load_wav(path)
