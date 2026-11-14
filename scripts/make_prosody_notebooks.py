@@ -596,6 +596,9 @@ Two robustness details (mirroring the live avatar):
   singing), the cell prints which features are off-scale. Predictions there
   are clipped to the |z| ≤ 5 boundary instead of saturating — treat their
   confidence as unreliable.
+- **Edge silence is trimmed** (VAD-style) before classification — studio
+  training clips have none, and leftover silence corrupts energy/pause
+  features. Trimmed seconds show as `6.4s speech (of 8.1s)`.
 """
 
 NB1_CODE_18 = """\
@@ -639,10 +642,13 @@ if WEIGHTS_PATH.is_file():
 
 
 def classify_wav(wav):
-    # Classify a waveform; files longer than MAX_FILE_S are split into
-    # SEGMENT_S chunks (mirroring the live avatar's VAD segmentation) and
-    # aggregated by mean probability. Also returns the max |z| score and the
-    # most out-of-distribution features seen, for diagnostics.
+    # Classify a waveform: edge silence is trimmed first (VAD-style, mirroring
+    # the live avatar), files longer than MAX_FILE_S are split into SEGMENT_S
+    # chunks and aggregated by mean probability. Also returns the max |z|
+    # score and the most out-of-distribution features seen, for diagnostics.
+    wav = pe.trim_edges(wav)
+    if len(wav) < pe.FRAME_LEN * 2:
+        return [], Counter(), 0.0, []
     seg = int(SEGMENT_S * pe.INPUT_SR)
     if len(wav) <= int(MAX_FILE_S * pe.INPUT_SR):
         chunks = [wav]
@@ -687,6 +693,8 @@ else:
         for p in files:
             try:
                 wav = trainer.load_wav(p)  # mono float32 @ 24 kHz
+                dur_raw = len(wav) / pe.INPUT_SR
+                wav = pe.trim_edges(wav)   # idempotent; classify_wav re-checks
                 probs_list, votes, max_z, ood = classify_wav(wav)
                 if not probs_list:
                     n_skip += 1
@@ -700,7 +708,8 @@ else:
                 counts[label] += 1
                 top3 = ", ".join(f"{pe.EMOTION_NAMES[i]} {probs[i]:.2f}" for i in order[:3])
                 dur = len(wav) / pe.INPUT_SR
-                detail = f"{dur:.1f}s"
+                detail = (f"{dur:.1f}s speech (of {dur_raw:.1f}s)" if dur_raw - dur > 0.2
+                          else f"{dur:.1f}s")
                 if len(probs_list) > 1:
                     tally = ", ".join(f"{pe.EMOTION_NAMES[k]}x{v}" for k, v in votes.most_common())
                     detail += f", {len(probs_list)} chunks: {tally}"
@@ -906,7 +915,8 @@ def validate_nb1(nb, pe_payload, tr_payload):
     assert tr_payload in cell3, "embedded train_prosody_emotion.py payload missing/altered"
     for needle in ("REPO_URL", "RAVDESS_URLS", "zenodo.org/records/1188976", "git lfs pull",
                    "speaker-grouped", "WEIGHTS_OUT", "prosody_emotion.npz", "TEST_AUDIO_DIR",
-                   "SEGMENT_S", "classify_wav", "max|z|", "EXTRA_AUDIO_DIR", "extra_files"):
+                   "SEGMENT_S", "classify_wav", "max|z|", "EXTRA_AUDIO_DIR", "extra_files",
+                   "trim_edges"):
         assert any(needle in "".join(c["source"]) for c in nb["cells"]), f"missing: {needle}"
     print(f"[ok] NB1 validated: {len(nb['cells'])} cells, all code cells compile, embeds byte-identical")
 
@@ -1002,6 +1012,9 @@ def dryrun_nb1(nb1, pe_payload, tr_payload):
     write_wav(probe_dir / "probe_quiet.wav", base, sr)
     write_wav(probe_dir / "probe_loud.wav", base * 3.0, sr)
     write_wav(probe_dir / "probe_long20s.wav", long20, sr)
+    write_wav(probe_dir / "probe_padded.wav",
+              np.concatenate([np.zeros(int(0.8 * sr), np.float32), base,
+                              np.zeros(int(1.6 * sr), np.float32)]), sr)
 
     # Train via the CLI on the synthetic data (fast, honest end-to-end run,
     # exercising --extra_dir and the default-on noise augmentation).
@@ -1037,6 +1050,7 @@ def dryrun_nb1(nb1, pe_payload, tr_payload):
     out = buf.getvalue()
     assert "chunks:" in out, f"20 s file was not segmented by the Step 8 cell:\n{out}"
     assert "in training" in out, f"--extra_dir files not flagged as in-training:\n{out}"
+    assert "(of " in out, f"padded file was not reported as trimmed:\n{out}"
 
     def _pred(path):
         wav = ns["trainer"].load_wav(path)
@@ -1046,7 +1060,9 @@ def dryrun_nb1(nb1, pe_payload, tr_payload):
     y_quiet = _pred(probe_dir / "probe_quiet.wav")
     y_loud = _pred(probe_dir / "probe_loud.wav")
     assert y_quiet == y_loud, f"gain invariance broken: quiet {y_quiet} vs loud {y_loud}"
-    print("[dryrun] Step 8 robustness: 20 s file segmented; gain-invariant prediction")
+    y_padded = _pred(probe_dir / "probe_padded.wav")
+    assert y_padded == y_quiet, f"edge-silence invariance broken: padded {y_padded} vs clean {y_quiet}"
+    print("[dryrun] Step 8 robustness: 20 s file segmented; gain- and edge-silence-invariant predictions")
 
     print(f"[dryrun] OK - synthetic end-to-end run passed ({tmp})")
 

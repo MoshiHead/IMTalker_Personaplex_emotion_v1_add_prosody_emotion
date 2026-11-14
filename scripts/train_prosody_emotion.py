@@ -402,6 +402,20 @@ def run_selftest(out_path: Path, folds: int, seed: int) -> None:
     if n_ok < pe.NUM_EMOTIONS - 1:
         sys.exit("noise-robustness guard failed: predictions collapse under channel noise")
 
+    # Edge-silence guard: profiles padded with 2.4 s of edge silence must still
+    # classify correctly (studio data is trimmed; real recordings are not).
+    preds_pad = []
+    for emo in range(pe.NUM_EMOTIONS):
+        x = synth_selftest_sample(emo, rng_guard)
+        pad = np.concatenate([np.zeros(int(0.6 * SR), np.float32), x,
+                              np.zeros(int(1.8 * SR), np.float32)]).astype(np.float32)
+        preds_pad.append(clf.predict(pad)[0])
+    n_ok = sum(int(p == e) for e, p in enumerate(preds_pad))
+    print(f"[ok] edge-silence guard: {n_ok}/{pe.NUM_EMOTIONS} profiles correct with "
+          f"2.4 s of edge silence: {[pe.EMOTION_NAMES[p] for p in preds_pad]}")
+    if n_ok < pe.NUM_EMOTIONS - 1:
+        sys.exit("edge-silence guard failed: predictions change under edge padding")
+
 
 # ---------------------------------------------------------------------------
 # main

@@ -89,7 +89,7 @@ tmp = Path(tempfile.mkdtemp(prefix="prosody_postwrite_"))
 sys.path.insert(0, str(tmp))
 import prosody_emotion as pe  # noqa: E402
 
-check("embedded module is format v2", pe.WEIGHTS_FORMAT_VERSION == 2,
+check("embedded module is format v3", pe.WEIGHTS_FORMAT_VERSION == 3,
       f"v{pe.WEIGHTS_FORMAT_VERSION}, z-clip {pe.Z_CLIP}, target rms {pe.TARGET_RMS}")
 sr = pe.INPUT_SR
 t = np.arange(int(2.5 * sr)) / sr

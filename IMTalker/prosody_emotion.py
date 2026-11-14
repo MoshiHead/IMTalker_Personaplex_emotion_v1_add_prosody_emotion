@@ -73,9 +73,10 @@ Z_CLIP = 5.0               # winsorise standardised features: legit training
                            # it can never saturate the softmax (conf 1.00 on
                            # every input) again. In-distribution predictions
                            # are untouched.
-WEIGHTS_FORMAT_VERSION = 2  # v2 = loudness-normalised features; v1 weights are
-                           # incompatible (different feature semantics) and are
-                           # rejected with a retrain hint.
+WEIGHTS_FORMAT_VERSION = 3  # v3 = edge-trimmed + loudness-normalised features.
+                           # v1/v2 weight files are incompatible (different
+                           # feature semantics) and are rejected with a retrain
+                           # hint.
 
 # ---------------------------------------------------------------------------
 # Feature layout (kept in ONE place; the trainer validates against this list)
@@ -164,6 +165,35 @@ def _contour_stats(vals: dict, name: str, v: np.ndarray, times: np.ndarray) -> N
     vals[f"{name}_slope"] = slope
 
 
+EDGE_TRIM_RANGE_DB = 35.0              # frames within this many dB of the peak
+                                       # frame count as speech at the edges
+EDGE_TRIM_FLOOR_DB = SILENCE_DB + 10.0  # absolute floor (-50 dBFS): below this
+                                        # a frame is silence no matter what
+
+
+def trim_edges(pcm: np.ndarray) -> np.ndarray:
+    """Trim leading/trailing (near-)silence from a waveform.
+
+    RAVDESS/CREMA-D clips are studio-trimmed; real recordings carry 0.5-2 s of
+    edge silence or fade-outs, which corrupts duration, rms_db stats/slopes,
+    flatness_slope and pause features (proven: padding a clean profile flips
+    its prediction and reproduces the exact out-of-distribution signature seen
+    on user audio). Only the edges are trimmed - internal pauses are preserved.
+    Returns an empty array when nothing is above the threshold.
+    """
+    x = np.asarray(pcm, dtype=np.float32).reshape(-1)
+    if x.shape[0] < FRAME_LEN * 2:
+        return x
+    sw = np.lib.stride_tricks.sliding_window_view(x, FRAME_LEN)[::HOP]
+    fr = np.sqrt(np.mean(np.square(sw, dtype=np.float32), axis=1))
+    fr_db = 20.0 * np.log10(fr + 1e-10)
+    thr = max(float(fr_db.max()) - EDGE_TRIM_RANGE_DB, EDGE_TRIM_FLOOR_DB)
+    above = np.nonzero(fr_db > thr)[0]
+    if above.size == 0:
+        return x[:0]
+    return x[above[0] * HOP: above[-1] * HOP + FRAME_LEN]
+
+
 def extract_features(pcm: np.ndarray) -> np.ndarray:
     """24 kHz float32 mono utterance -> FEATURE_NAMES-ordered feature vector.
 
@@ -174,6 +204,14 @@ def extract_features(pcm: np.ndarray) -> np.ndarray:
     x = np.asarray(pcm, dtype=np.float32).reshape(-1)
     n = int(x.shape[0])
     zeros = np.zeros(FEATURE_DIM, dtype=np.float32)
+    if n < FRAME_LEN * 2:
+        return zeros
+
+    # VAD edge trim: real-world files carry leading/trailing silence that the
+    # studio training data never shows (see trim_edges). Idempotent no-op on
+    # already-trimmed input (RAVDESS, live VAD utterances).
+    x = trim_edges(x)
+    n = int(x.shape[0])
     if n < FRAME_LEN * 2:
         return zeros
 

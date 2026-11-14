@@ -98,8 +98,8 @@ check("rule confidences in (0, 1]", 0.0 < conf_e <= 1.0 and 0.0 < conf_c <= 1.0,
       f"{conf_e:.3f}, {conf_c:.3f}")
 probs_e = clf.model.predict_proba(pe.extract_features(excited))
 probs_c = clf.model.predict_proba(pe.extract_features(calm))
-high_arousal = (1, 3, 4)   # happy / angry / surprise
-low_arousal = (0, 2)       # neutral / sad
+high_arousal = (1, 3, 4, 5)   # happy / angry / surprise / fear (all high-arousal)
+low_arousal = (0, 2)          # neutral / sad
 check("excited signal scores higher on high-arousal emotions",
       probs_e[list(high_arousal)].sum() > probs_c[list(high_arousal)].sum(),
       f"{probs_e[list(high_arousal)].sum():.2f} vs {probs_c[list(high_arousal)].sum():.2f}")
@@ -174,6 +174,40 @@ except ValueError as exc:
 clf_v1 = pe.ProsodyEmotionClassifier(weights_path=v1, verbose=False)
 check("v1 weights degrade to the rule fallback (no crash)",
       clf_v1.backend == "rules", clf_v1.backend)
+v2 = tmp_dir / "v2.npz"
+np.savez(v2, W=W, b=b, feat_mean=mu, feat_std=sd,
+         feature_names=np.array(pe.FEATURE_NAMES), temperature=np.float32(1.0),
+         format_version=np.int32(2))
+try:
+    pe.load_weights(v2)
+    check("format v2 weights are also rejected (v3 = edge-trimmed)", False)
+except ValueError as exc:
+    check("format v2 weights are also rejected (v3 = edge-trimmed)",
+          "format v2" in str(exc), str(exc)[:60])
+
+# --- 6d. VAD edge trim (the edge-silence regression guard) ---------------------
+# Studio training clips are tightly trimmed; real recordings carry 0.5-2 s of
+# edge silence that corrupted duration/rms_db/slope features and flipped
+# predictions (reproduced experimentally with exactly this padding).
+sig_trim = synth(f0_mean=180.0, f0_mod_depth=40.0, amp=0.3, syll_hz=4.0, seed=6)
+padded = np.concatenate([np.zeros(int(0.6 * SR), np.float32), sig_trim,
+                         np.zeros(int(1.8 * SR), np.float32)])
+trimmed = pe.trim_edges(padded)
+check("edge trim removes padding (within 0.1 s)",
+      abs(len(trimmed) - len(sig_trim)) <= int(0.1 * SR),
+      f"{len(sig_trim)} vs {len(trimmed)} samples")
+check("edge trim is idempotent", len(pe.trim_edges(trimmed)) == len(trimmed))
+check("all-silent input trims to empty", pe.trim_edges(np.zeros(SR)).size == 0)
+lab_clean = pe.EMOTION_NAMES[int(np.argmax(pe._RULE_MODEL.predict_proba(
+    pe.extract_features(sig_trim))))]
+lab_pad = pe.EMOTION_NAMES[int(np.argmax(pe._RULE_MODEL.predict_proba(
+    pe.extract_features(padded))))]
+check("edge silence no longer flips the rule prediction", lab_clean == lab_pad,
+      f"{lab_clean} vs {lab_pad}")
+dur_clean = pe.extract_features(sig_trim)[pe.FEATURE_NAMES.index("duration")]
+dur_pad = pe.extract_features(padded)[pe.FEATURE_NAMES.index("duration")]
+check("duration feature is silence-invariant after trim",
+      abs(dur_clean - dur_pad) < 0.1, f"{dur_clean:.2f} vs {dur_pad:.2f}")
 
 # --- 6b. v2 loudness normalisation (the all-angry regression guard) ------------
 # The same utterance at a different recording level must yield (nearly) the
