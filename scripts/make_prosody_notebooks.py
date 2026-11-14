@@ -567,12 +567,27 @@ soundfile build; unreadable files are reported, not fatal). Silent or
 too-short clips are skipped with a note. The cell reloads the trainer helpers
 and the trained weights if they are not in memory, so it also works after a
 kernel restart.
+
+Two robustness details (mirroring the live avatar):
+
+- **Long files are segmented** into ~4 s chunks — the model was trained on
+  1–10 s utterances, and the live avatar classifies VAD segments of the same
+  size. Per-chunk votes are shown and the final prediction averages the
+  chunk probabilities.
+- **Out-of-distribution warnings**: if a file's features sit far outside the
+  RAVDESS training distribution (max |z| > 5, e.g. another language, shouting,
+  singing), the cell prints which features are off-scale. Predictions there
+  are clipped to the |z| ≤ 5 boundary instead of saturating — treat their
+  confidence as unreliable.
 """
 
 NB1_CODE_18 = """\
 # --- Test the trained classifier on your own audio folder ---------------------
 TEST_AUDIO_DIR = "/workspace/audio"  # <-- edit me, then re-run this cell
 AUDIO_EXTS = {".wav", ".flac", ".ogg", ".mp3", ".m4a"}
+SEGMENT_S = 4.0    # classify long files in utterance-sized chunks (like the live VAD)
+MAX_FILE_S = 6.0   # files longer than this are segmented and their votes averaged
+OOD_Z = 5.0        # |z| beyond this = feature far outside the training distribution
 
 import time
 from collections import Counter
@@ -597,6 +612,37 @@ if "clf" not in dir() or getattr(clf, "backend", None) != "softmax":
     clf = pe.ProsodyEmotionClassifier(weights_path=str(WEIGHTS_PATH))
     assert clf.backend == "softmax", "trained weights not loaded - run the training cell first"
 
+
+def classify_wav(wav):
+    # Classify a waveform; files longer than MAX_FILE_S are split into
+    # SEGMENT_S chunks (mirroring the live avatar's VAD segmentation) and
+    # aggregated by mean probability. Also returns the max |z| score and the
+    # most out-of-distribution features seen, for diagnostics.
+    seg = int(SEGMENT_S * pe.INPUT_SR)
+    if len(wav) <= int(MAX_FILE_S * pe.INPUT_SR):
+        chunks = [wav]
+    else:
+        chunks = [wav[i:i + seg] for i in range(0, len(wav), seg)]
+        if len(chunks) > 1 and len(chunks[-1]) < seg // 4:
+            chunks[-2] = np.concatenate([chunks[-2], chunks[-1]])
+            chunks.pop()
+    mu, sd = clf.model.feat_mean, clf.model.feat_std
+    probs_list, votes, max_z, ood = [], Counter(), 0.0, []
+    for c in chunks:
+        feats = pe.extract_features(c)
+        if not feats.any():
+            continue
+        z = np.nan_to_num((feats - mu) / sd, nan=0.0, posinf=0.0, neginf=0.0)
+        az = np.abs(z)
+        if float(az.max()) > max_z:
+            max_z = float(az.max())
+            ood = [(pe.FEATURE_NAMES[i], float(z[i])) for i in np.argsort(-az)[:3]]
+        p = clf.model.predict_proba(feats)  # clips z at +/-pe.Z_CLIP internally
+        probs_list.append(p)
+        votes[int(np.argmax(p))] += 1
+    return probs_list, votes, max_z, ood
+
+
 test_dir = Path(TEST_AUDIO_DIR)
 if not test_dir.is_dir():
     print(f"[skip] TEST_AUDIO_DIR does not exist: {test_dir}")
@@ -608,36 +654,49 @@ else:
     else:
         print(f"[test] classifying {len(files)} file(s) from {test_dir} "
               f"(weights: {clf.weights_path})\\n")
-        print(f"{'file':<50} {'predicted':<14} {'conf':>5}  top-3")
-        print("-" * 100)
+        print(f"{'file':<50} {'predicted':<14} {'conf':>5}  top-3  [details]")
+        print("-" * 110)
         counts = Counter()
-        n_skip = n_err = 0
+        n_skip = n_err = n_ood = 0
         t0 = time.perf_counter()
         for p in files:
             try:
                 wav = trainer.load_wav(p)  # mono float32 @ 24 kHz
-                feats = pe.extract_features(wav)
-                if not feats.any():
+                probs_list, votes, max_z, ood = classify_wav(wav)
+                if not probs_list:
                     n_skip += 1
                     print(f"{p.name[:50]:<50} {'skipped':<14} {'--':>5}  silent or too short")
                     continue
-                probs = clf.model.predict_proba(feats)
+                probs = np.mean(probs_list, axis=0)
                 order = np.argsort(probs)[::-1]
                 y = int(order[0])
                 label = pe.EMOTION_NAMES[y]
                 conf = float(probs[y])
                 counts[label] += 1
                 top3 = ", ".join(f"{pe.EMOTION_NAMES[i]} {probs[i]:.2f}" for i in order[:3])
-                print(f"{p.name[:50]:<50} {label + f' ({y})':<14} {conf:5.2f}  {top3}")
+                dur = len(wav) / pe.INPUT_SR
+                detail = f"{dur:.1f}s"
+                if len(probs_list) > 1:
+                    tally = ", ".join(f"{pe.EMOTION_NAMES[k]}x{v}" for k, v in votes.most_common())
+                    detail += f", {len(probs_list)} chunks: {tally}"
+                print(f"{p.name[:50]:<50} {label + f' ({y})':<14} {conf:5.2f}  {top3}  [{detail}]")
+                if max_z > OOD_Z:
+                    n_ood += 1
+                    worst = ", ".join(f"{n} z={v:+.1f}" for n, v in ood if abs(v) > OOD_Z)
+                    print(f"{'':<52}[warn] out-of-distribution (max|z|={max_z:.1f}): {worst}")
             except Exception as exc:
                 n_err += 1
                 print(f"{p.name[:50]:<50} ERROR: {exc}")
         dt = time.perf_counter() - t0
-        print("-" * 100)
+        print("-" * 110)
         summary = ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "none"
         print(f"[summary] {sum(counts.values())}/{len(files)} classified: {summary}")
         if n_skip or n_err:
             print(f"[info] {n_skip} skipped (silent/short), {n_err} unreadable")
+        if n_ood:
+            print(f"[warn] {n_ood} file(s) were far outside the RAVDESS training distribution")
+            print(f"       (max|z| > {OOD_Z:.0f}); their confidence is unreliable - predictions")
+            print(f"       there are clipped to the |z| <= {pe.Z_CLIP:.0f} boundary, not saturated.")
         if counts:
             print(f"[info] avg {dt / sum(counts.values()) * 1000:.1f} ms/file")
 """
@@ -815,7 +874,8 @@ def validate_nb1(nb, pe_payload, tr_payload):
     assert pe_payload in cell3, "embedded prosody_emotion.py payload missing/altered"
     assert tr_payload in cell3, "embedded train_prosody_emotion.py payload missing/altered"
     for needle in ("REPO_URL", "RAVDESS_URLS", "zenodo.org/records/1188976", "git lfs pull",
-                   "speaker-grouped", "WEIGHTS_OUT", "prosody_emotion.npz", "TEST_AUDIO_DIR"):
+                   "speaker-grouped", "WEIGHTS_OUT", "prosody_emotion.npz", "TEST_AUDIO_DIR",
+                   "SEGMENT_S", "classify_wav", "max|z|"):
         assert any(needle in "".join(c["source"]) for c in nb["cells"]), f"missing: {needle}"
     print(f"[ok] NB1 validated: {len(nb['cells'])} cells, all code cells compile, embeds byte-identical")
 
@@ -913,6 +973,40 @@ def dryrun_nb1(nb1, pe_payload, tr_payload):
     test_src = cells["prosody-train-17"].replace('"/workspace/audio"', f'"{rav.as_posix()}"')
     exec(compile(test_src, "<cell-17>", "exec"), ns)
     print("[dryrun] Step 8 batch-test cell executed against the synthetic folder")
+
+    # Step 8 robustness: a 20 s file must be segmented into chunks, and the
+    # same utterance 9.5 dB louder must predict the same emotion (the
+    # loudness-collapse regression guard).
+    import contextlib
+    import io
+
+    probe_dir = tmp / "probe_audio"
+    probe_dir.mkdir()
+    t3 = np.arange(int(sr * 3.0)) / sr
+    base = (0.2 * np.sin(2 * np.pi * 140 * t3)
+            * (0.5 + 0.5 * np.sin(2 * np.pi * 3.5 * t3))).astype("float32")
+    t20 = np.arange(int(sr * 20.0)) / sr
+    long20 = (0.2 * np.sin(2 * np.pi * 175 * t20)
+              * (0.5 + 0.5 * np.sin(2 * np.pi * 2.5 * t20))).astype("float32")
+    write_wav(probe_dir / "probe_quiet.wav", base, sr)
+    write_wav(probe_dir / "probe_loud.wav", base * 3.0, sr)
+    write_wav(probe_dir / "probe_long20s.wav", long20, sr)
+    test_src2 = cells["prosody-train-17"].replace('"/workspace/audio"', f'"{probe_dir.as_posix()}"')
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        exec(compile(test_src2, "<cell-17b>", "exec"), ns)
+    out = buf.getvalue()
+    assert "chunks:" in out, f"20 s file was not segmented by the Step 8 cell:\n{out}"
+
+    def _pred(path):
+        wav = ns["trainer"].load_wav(path)
+        probs_list, votes, max_z, ood = ns["classify_wav"](wav)
+        return int(np.argmax(np.mean(probs_list, axis=0)))
+
+    y_quiet = _pred(probe_dir / "probe_quiet.wav")
+    y_loud = _pred(probe_dir / "probe_loud.wav")
+    assert y_quiet == y_loud, f"gain invariance broken: quiet {y_quiet} vs loud {y_loud}"
+    print("[dryrun] Step 8 robustness: 20 s file segmented; gain-invariant prediction")
 
     print(f"[dryrun] OK - synthetic end-to-end run passed ({tmp})")
 

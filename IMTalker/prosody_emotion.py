@@ -60,6 +60,22 @@ NUM_MEL = 26
 NUM_MFCC = 13
 MEL_FMAX = 8000.0
 SILENCE_DB = -60.0         # whole-utterance guard: below this -> no speech
+TARGET_RMS = 0.1           # loudness-normalisation target (~-20 dBFS RMS):
+                           # recording level is NOT an emotion cue. Without this
+                           # normalisation the level-dependent features
+                           # (rms_db_*, mfcc1_*, shimmer) go out-of-distribution
+                           # for any non-studio-level input and the softmax
+                           # collapses to one class for every file.
+RMS_SILENCE = 10.0 ** (SILENCE_DB / 20.0)  # -60 dBFS utterance-RMS guard
+Z_CLIP = 5.0               # winsorise standardised features: legit training
+                           # variation is |z| <~ 3.5; clipping bounds the logit
+                           # contribution of any out-of-distribution feature so
+                           # it can never saturate the softmax (conf 1.00 on
+                           # every input) again. In-distribution predictions
+                           # are untouched.
+WEIGHTS_FORMAT_VERSION = 2  # v2 = loudness-normalised features; v1 weights are
+                           # incompatible (different feature semantics) and are
+                           # rejected with a retrain hint.
 
 # ---------------------------------------------------------------------------
 # Feature layout (kept in ONE place; the trainer validates against this list)
@@ -160,6 +176,13 @@ def extract_features(pcm: np.ndarray) -> np.ndarray:
     zeros = np.zeros(FEATURE_DIM, dtype=np.float32)
     if n < FRAME_LEN * 2:
         return zeros
+
+    # Utterance-level silence guard (un-normalised signal), then loudness
+    # normalisation so rms_db/mfcc/shimmer features are level-invariant.
+    u_rms = float(np.sqrt(np.mean(np.square(x.astype(np.float64)))))
+    if u_rms < RMS_SILENCE:
+        return zeros
+    x = (x * (TARGET_RMS / u_rms)).astype(np.float32)
 
     sw = np.lib.stride_tricks.sliding_window_view(x, FRAME_LEN)
     frames = sw[::HOP]                      # (n_frames, FRAME_LEN), a view
@@ -271,6 +294,8 @@ class _SoftmaxEmotionModel:
 
     def predict_proba(self, feats: np.ndarray) -> np.ndarray:
         z = (np.asarray(feats, dtype=np.float32) - self.feat_mean) / self.feat_std
+        z = np.nan_to_num(z, nan=0.0, posinf=Z_CLIP, neginf=-Z_CLIP)
+        z = np.clip(z, -Z_CLIP, Z_CLIP)
         logits = (self.W @ z + self.b) / max(self.temperature, 1e-3)
         logits = logits - logits.max()
         e = np.exp(logits)
@@ -288,10 +313,16 @@ class _SoftmaxEmotionModel:
 #   neutral  - the flat middle ground (negative weights on variability)
 # ---------------------------------------------------------------------------
 
+# Priors for the level-dependent features are calibrated to the
+# loudness-normalised (v2) feature space: after normalisation every utterance
+# has RMS 0.1, pinning rms_db_mean near -23 dB and flux near 0.5 (measured on
+# the trainer's synthetic profiles). The old un-normalised priors
+# (rms_db -30 dB, flux 0.03) would give every input the same large angry-biased
+# z-scores.
 _BASE_PRIORS = {
-    "rms_db": (-30.0, 6.0), "f0": (150.0, 60.0), "zcr": (0.12, 0.05),
+    "rms_db": (-23.0, 6.0), "f0": (150.0, 60.0), "zcr": (0.12, 0.05),
     "centroid": (1600.0, 500.0), "rolloff": (3200.0, 1000.0),
-    "flatness": (0.06, 0.03), "flux": (0.03, 0.02),
+    "flatness": (0.06, 0.03), "flux": (0.5, 0.25),
 }
 _EXTRA_PRIORS = {
     "voiced_ratio": (0.75, 0.10), "syll_rate": (4.0, 1.5), "pause_ratio": (0.15, 0.10),
@@ -333,7 +364,8 @@ def _prior_for(feature_name: str) -> tuple:
         mu, sigma = _EXTRA_PRIORS[feature_name]
         return mu, max(sigma, 1e-6)
     if feature_name.startswith("mfcc"):
-        return (0.0, 8.0) if feature_name.endswith("_mean") else (4.0, 2.0)
+        # cosmetic only - no rule weights touch the mfcc features
+        return (40.0, 12.0) if feature_name.endswith("_mean") else (10.0, 4.0)
     return 0.0, 1.0
 
 
@@ -373,12 +405,20 @@ def save_weights(path, W: np.ndarray, b: np.ndarray, feat_mean: np.ndarray,
         feat_std=np.asarray(feat_std, dtype=np.float32),
         feature_names=np.array(FEATURE_NAMES),
         temperature=np.float32(temperature),
-        format_version=np.int32(1),
+        format_version=np.int32(WEIGHTS_FORMAT_VERSION),
     )
 
 
 def load_weights(path) -> _SoftmaxEmotionModel:
     data = np.load(path, allow_pickle=False)
+    version = int(data["format_version"]) if "format_version" in data.files else 1
+    if version != WEIGHTS_FORMAT_VERSION:
+        raise ValueError(
+            f"weight file {path} is format v{version} but this prosody_emotion.py "
+            f"expects v{WEIGHTS_FORMAT_VERSION} (loudness-normalised features). "
+            f"Retrain with scripts/train_prosody_emotion.py (or re-run the "
+            f"training notebook) to regenerate prosody_emotion.npz."
+        )
     names = [str(x) for x in data["feature_names"]]
     if tuple(names) != FEATURE_NAMES:
         raise ValueError(

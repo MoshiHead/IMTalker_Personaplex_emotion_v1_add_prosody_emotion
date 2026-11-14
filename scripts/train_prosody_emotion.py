@@ -221,7 +221,9 @@ def speaker_cv(X, y, speakers, folds: int = 5, seed: int = 0):
         test_mask = np.isin(speakers, groups[k])
         train_mask = ~test_mask
         mu = X[train_mask].mean(0)
-        sd = X[train_mask].std(0) + 1e-6
+        # 1e-3 floor (not 1e-6): after loudness normalisation some features are
+        # near-constant, and a near-zero std would make z-scores unstable.
+        sd = np.maximum(X[train_mask].std(0), 1e-3)
         W, b = train_softmax((X[train_mask] - mu) / sd, y[train_mask], seed=seed + k)
         acc, pred = evaluate(W, b, (X[test_mask] - mu) / sd, y[test_mask])
         oof[test_mask] = pred
@@ -363,7 +365,7 @@ def main() -> None:
     print_report(y, oof, "speaker-independent CV (held-out speakers = unseen voices)")
 
     # final model: all data
-    mu, sd = X.mean(0), X.std(0) + 1e-6
+    mu, sd = X.mean(0), np.maximum(X.std(0), 1e-3)
     W, b = train_softmax((X - mu) / sd, y, seed=args.seed)
     train_acc, _ = evaluate(W, b, (X - mu) / sd, y)
     print(f"\nfinal model train accuracy (all data): {train_acc:.1%}")

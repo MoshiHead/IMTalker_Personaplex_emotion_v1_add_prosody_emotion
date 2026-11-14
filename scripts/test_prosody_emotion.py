@@ -151,12 +151,54 @@ check("trained softmax separates the synthetic blobs", train_acc > 0.95, f"{trai
 # corrupted layout -> ValueError
 bad = tmp_dir / "bad.npz"
 np.savez(bad, W=W, b=b, feat_mean=mu, feat_std=sd,
-         feature_names=np.array(["wrong"] * D), temperature=np.float32(1.0))
+         feature_names=np.array(["wrong"] * D), temperature=np.float32(1.0),
+         format_version=np.int32(pe.WEIGHTS_FORMAT_VERSION))
 try:
     pe.load_weights(bad)
     check("layout-mismatched npz raises ValueError", False)
 except ValueError:
     check("layout-mismatched npz raises ValueError", True)
+
+# legacy format-v1 weight file (pre loudness normalisation) -> clear retrain
+# error, and the classifier degrades to the rule fallback instead of crashing
+v1 = tmp_dir / "v1.npz"
+np.savez(v1, W=W, b=b, feat_mean=mu, feat_std=sd,
+         feature_names=np.array(pe.FEATURE_NAMES), temperature=np.float32(1.0),
+         format_version=np.int32(1))
+try:
+    pe.load_weights(v1)
+    check("format v1 weights are rejected with a retrain hint", False)
+except ValueError as exc:
+    check("format v1 weights are rejected with a retrain hint", "format v1" in str(exc),
+          str(exc)[:80])
+clf_v1 = pe.ProsodyEmotionClassifier(weights_path=v1, verbose=False)
+check("v1 weights degrade to the rule fallback (no crash)",
+      clf_v1.backend == "rules", clf_v1.backend)
+
+# --- 6b. v2 loudness normalisation (the all-angry regression guard) ------------
+# The same utterance at a different recording level must yield (nearly) the
+# same features and the same prediction; before v2 a level change pushed the
+# level-dependent features far out of distribution and collapsed every input
+# to one class.
+sig_quiet = synth(f0_mean=180.0, f0_mod_depth=40.0, amp=0.05, syll_hz=4.0, seed=5)
+f_quiet = pe.extract_features(sig_quiet)
+f_loud = pe.extract_features(sig_quiet * 6.0)   # +15.6 dB, same utterance
+check("loudness normalisation makes features gain-invariant",
+      np.allclose(f_quiet, f_loud, rtol=5e-2, atol=5e-3),
+      f"max abs diff {np.abs(f_quiet - f_loud).max():.4f}")
+lab_q = pe.EMOTION_NAMES[int(np.argmax(pe._RULE_MODEL.predict_proba(f_quiet)))]
+lab_l = pe.EMOTION_NAMES[int(np.argmax(pe._RULE_MODEL.predict_proba(f_loud)))]
+check("gain change no longer flips the rule prediction", lab_q == lab_l,
+      f"{lab_q} vs {lab_l}")
+
+# --- 6c. z-score clipping winsorises absurd features ---------------------------
+p5 = model.predict_proba((mu + 5.5 * sd).astype(np.float32))
+p50 = model.predict_proba((mu + 50.0 * sd).astype(np.float32))
+check("z-clipping winsorises absurd features to the clip boundary",
+      np.allclose(p5, p50, atol=1e-5), f"max diff {np.abs(p5 - p50).max():.2e}")
+check("z-clipped probs stay valid on absurd input",
+      np.isfinite(p50).all() and abs(float(p50.sum()) - 1.0) < 1e-4,
+      f"sum {p50.sum():.4f}")
 
 # --- 7. SpeechEmotionClassifier routing -----------------------------------------
 ser = SpeechEmotionClassifier("prosody-v1", device="cpu", half=False, disgust_map=0)
