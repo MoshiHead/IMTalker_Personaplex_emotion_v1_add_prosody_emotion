@@ -106,6 +106,8 @@ construction).
    final refit on 100% of the data.
 5. Write the ~7 KB weights to `IMTalker/checkpoints/prosody_emotion.npz` and
    copy them to `/workspace/prosody_emotion.npz` for the streaming notebook.
+6. *(Optional)* Batch-test any audio folder against the trained weights with
+   confidence scores (Step 8).
 
 **Runtime** on a RunPod CPU: ~25–40 min total (downloads ~5–10 min, feature
 extraction ~15–25 min with augmentation, the training itself takes seconds).
@@ -237,6 +239,8 @@ NB1_MD_16 = """\
    at `/workspace/prosody_emotion.npz` (Jupyter file upload) before Step 12.
 3. No weights file at all → the avatar still runs on the built-in rule-based
    prosody fallback; retraining is optional.
+4. **Step 8** above batch-tests any audio folder (`TEST_AUDIO_DIR`) against
+   the trained weights with confidence scores — re-runnable at any time.
 
 **Rollback:** delete `IMTalker/checkpoints/prosody_emotion.npz` (rule fallback)
 or set `SER_MODEL` to any HF backend — every previous SER model remains
@@ -550,6 +554,95 @@ print("       ran elsewhere, upload the .npz to the pod at /workspace/prosody_em
 """
 
 
+NB1_MD_17 = """\
+## Step 8 — Test on your own audio folder (optional, re-runnable)
+
+Point `TEST_AUDIO_DIR` at any folder of audio clips and re-run the cell below
+as often as you like — no retraining needed. The trained `.npz` is loaded once
+and every file is classified with its **confidence score** plus the top-3
+probability breakdown.
+
+Recursively scans `.wav .flac .ogg .mp3 .m4a` (mp3/m4a support depends on the
+soundfile build; unreadable files are reported, not fatal). Silent or
+too-short clips are skipped with a note. The cell reloads the trainer helpers
+and the trained weights if they are not in memory, so it also works after a
+kernel restart.
+"""
+
+NB1_CODE_18 = """\
+# --- Test the trained classifier on your own audio folder ---------------------
+TEST_AUDIO_DIR = "/workspace/audio"  # <-- edit me, then re-run this cell
+AUDIO_EXTS = {".wav", ".flac", ".ogg", ".mp3", ".m4a"}
+
+import time
+from collections import Counter
+from pathlib import Path
+
+import numpy as np
+
+# Re-runnable standalone (e.g. after a kernel restart): reload helpers/weights.
+if "WEIGHTS_PATH" not in dir():
+    WEIGHTS_PATH = Path(PROJECT_ROOT) / "IMTalker" / "checkpoints" / "prosody_emotion.npz"
+if "trainer" not in dir():
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location(
+        "train_prosody_emotion", Path(PROJECT_ROOT) / "scripts" / "train_prosody_emotion.py")
+    trainer = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(trainer)
+if "pe" not in dir():
+    import sys
+    sys.path.insert(0, str(Path(PROJECT_ROOT) / "IMTalker"))
+    import prosody_emotion as pe
+if "clf" not in dir() or getattr(clf, "backend", None) != "softmax":
+    clf = pe.ProsodyEmotionClassifier(weights_path=str(WEIGHTS_PATH))
+    assert clf.backend == "softmax", "trained weights not loaded - run the training cell first"
+
+test_dir = Path(TEST_AUDIO_DIR)
+if not test_dir.is_dir():
+    print(f"[skip] TEST_AUDIO_DIR does not exist: {test_dir}")
+    print("       upload audio there (or edit the path above) and re-run this cell")
+else:
+    files = sorted(p for p in test_dir.rglob("*") if p.suffix.lower() in AUDIO_EXTS)
+    if not files:
+        print(f"[warn] no audio files ({', '.join(sorted(AUDIO_EXTS))}) found under {test_dir}")
+    else:
+        print(f"[test] classifying {len(files)} file(s) from {test_dir} "
+              f"(weights: {clf.weights_path})\\n")
+        print(f"{'file':<50} {'predicted':<14} {'conf':>5}  top-3")
+        print("-" * 100)
+        counts = Counter()
+        n_skip = n_err = 0
+        t0 = time.perf_counter()
+        for p in files:
+            try:
+                wav = trainer.load_wav(p)  # mono float32 @ 24 kHz
+                feats = pe.extract_features(wav)
+                if not feats.any():
+                    n_skip += 1
+                    print(f"{p.name[:50]:<50} {'skipped':<14} {'--':>5}  silent or too short")
+                    continue
+                probs = clf.model.predict_proba(feats)
+                order = np.argsort(probs)[::-1]
+                y = int(order[0])
+                label = pe.EMOTION_NAMES[y]
+                conf = float(probs[y])
+                counts[label] += 1
+                top3 = ", ".join(f"{pe.EMOTION_NAMES[i]} {probs[i]:.2f}" for i in order[:3])
+                print(f"{p.name[:50]:<50} {label + f' ({y})':<14} {conf:5.2f}  {top3}")
+            except Exception as exc:
+                n_err += 1
+                print(f"{p.name[:50]:<50} ERROR: {exc}")
+        dt = time.perf_counter() - t0
+        print("-" * 100)
+        summary = ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "none"
+        print(f"[summary] {sum(counts.values())}/{len(files)} classified: {summary}")
+        if n_skip or n_err:
+            print(f"[info] {n_skip} skipped (silent/short), {n_err} unreadable")
+        if counts:
+            print(f"[info] avg {dt / sum(counts.values()) * 1000:.1f} ms/file")
+"""
+
+
 def build_nb1(pe_payload, tr_payload):
     cells = [
         md_cell("prosody-train-00", NB1_MD_00),
@@ -568,7 +661,9 @@ def build_nb1(pe_payload, tr_payload):
         code_cell("prosody-train-13", NB1_CODE_13),
         md_cell("prosody-train-14", NB1_MD_14),
         code_cell("prosody-train-15", NB1_CODE_15),
-        md_cell("prosody-train-16", NB1_MD_16),
+        md_cell("prosody-train-16", NB1_MD_17),
+        code_cell("prosody-train-17", NB1_CODE_18),
+        md_cell("prosody-train-18", NB1_MD_16),
     ]
     return make_nb(cells)
 
@@ -707,7 +802,7 @@ def _compile_cell(source, cid, tolerate_magics):
 def validate_nb1(nb, pe_payload, tr_payload):
     json.dumps(nb)  # JSON-serializable
     ids = [c["id"] for c in nb["cells"]]
-    assert ids == [f"prosody-train-{i:02d}" for i in range(17)], f"unexpected cell ids: {ids}"
+    assert ids == [f"prosody-train-{i:02d}" for i in range(19)], f"unexpected cell ids: {ids}"
     for c in nb["cells"]:
         src = "".join(c["source"])
         if c["cell_type"] == "code":
@@ -720,7 +815,7 @@ def validate_nb1(nb, pe_payload, tr_payload):
     assert pe_payload in cell3, "embedded prosody_emotion.py payload missing/altered"
     assert tr_payload in cell3, "embedded train_prosody_emotion.py payload missing/altered"
     for needle in ("REPO_URL", "RAVDESS_URLS", "zenodo.org/records/1188976", "git lfs pull",
-                   "speaker-grouped", "WEIGHTS_OUT", "prosody_emotion.npz"):
+                   "speaker-grouped", "WEIGHTS_OUT", "prosody_emotion.npz", "TEST_AUDIO_DIR"):
         assert any(needle in "".join(c["source"]) for c in nb["cells"]), f"missing: {needle}"
     print(f"[ok] NB1 validated: {len(nb['cells'])} cells, all code cells compile, embeds byte-identical")
 
@@ -813,6 +908,12 @@ def dryrun_nb1(nb1, pe_payload, tr_payload):
     ns["WEIGHTS_PATH"] = weights
     exec(compile(cells["prosody-train-15"], "<cell-15>", "exec"), ns)  # validate + hand off
     assert Path(ns["WEIGHTS_OUT"]).is_file(), "hand-off copy missing"
+
+    # Step 8 — batch-test cell against the synthetic dataset folder
+    test_src = cells["prosody-train-17"].replace('"/workspace/audio"', f'"{rav.as_posix()}"')
+    exec(compile(test_src, "<cell-17>", "exec"), ns)
+    print("[dryrun] Step 8 batch-test cell executed against the synthetic folder")
+
     print(f"[dryrun] OK - synthetic end-to-end run passed ({tmp})")
 
 
