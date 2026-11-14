@@ -34,4 +34,4 @@ IMTalker/checkpoints/
 # RAG "thinking sound" silently has nothing to play on a fresh clone.
 !personaplex/ai-thinking-sound.wav
 *.npy
-*.npz
+# *.npz
